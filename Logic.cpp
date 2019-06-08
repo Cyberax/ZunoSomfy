@@ -18,6 +18,7 @@ OLED oled;
 #define MOVE_MOTOR_TO_POS 0xFCu
 #define HERE_IS_MOTOR 0x9Fu
 #define HERE_IS_POSITION 0xF2u
+#define MOVE_MOTOR_TO_LIMIT 0xFCu
 
 //#define DEBUG_PRINT
 
@@ -29,9 +30,17 @@ struct Blinds {
 //	word minPos, maxPos;
 	byte curPercentage;
 
-	byte commanded, commandedPercent;
+	// Commanded position
+	byte commanded, commandedPercent, commandReceived;
+	dword commandedTime;
+
+	// Health status
+	dword lastTimeUpdated;
+	byte isOffline;
 };
 #define MAX_BLINDS 4
+#define OFFLINE_TIMEOUT 30000
+
 Blinds blinds[MAX_BLINDS];
 byte numBlinds = 0;
 
@@ -39,6 +48,8 @@ byte numBlinds = 0;
 enum mode_t {DISCOVERY, JOINING, OPERATION};
 mode_t globalMode;
 dword lastInterestingTime, lastTimeRead;
+dword lastReportSent;
+byte oledIsOff;
 
 void initOled();
 void printStatus();
@@ -49,12 +60,20 @@ void initMotor(byte i, byte i1, byte i2);
 bool readMotorStates();
 void readMode();
 void setMode(mode_t mode);
-void readBlinds();
-void writeBlinds();
+void loadBlinds();
+void saveBlindSettings();
 
 void setupChannels();
 
-bool processCommandedStatus();
+void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport);
+
+void sendReportThrottled(bool important);
+
+void my_memzero(void *ptr, word sz) {
+	for(word i=0; i<sz; ++i) {
+		((byte*)ptr)[i] = 0;
+	}
+}
 
 void real_setup() {
 	initOled();
@@ -69,13 +88,12 @@ void real_setup() {
 	// Debug serial
 	Serial.begin(19200);
 
-	for(byte i=0; i<MAX_BLINDS; ++i) {
-		blinds[i].commanded = blinds[i].commandedPercent = 0;
-	}
+	lastReportSent = 0;
 
+	my_memzero(blinds, sizeof(Blinds)*MAX_BLINDS);
 	readMode();
 	if (globalMode == JOINING || globalMode == OPERATION) {
-		readBlinds();
+		loadBlinds();
 		setupChannels();
 	} else {
 		numBlinds = 0;
@@ -90,6 +108,13 @@ void real_setup() {
 	}
 
 	printStatus();
+}
+
+bool differsBy(dword v1, dword v2, dword diff) {
+	if (v1 >= v2) {
+		return v1 - v2 >= diff;
+	}
+	return v2 - v1 >= diff;
 }
 
 void setupChannels() {
@@ -116,7 +141,7 @@ void setMode(mode_t mode) {
 	}
 }
 
-void readBlinds() {
+void loadBlinds() {
 	byte pos = 2;
 	numBlinds = EEPROM.read(pos++);
 	if (numBlinds > MAX_BLINDS) {
@@ -127,10 +152,12 @@ void readBlinds() {
 		blinds[i].addr2 = EEPROM.read(pos++);
 		blinds[i].addr3 = EEPROM.read(pos++);
 		blinds[i].curPercentage = 255;
+		blinds[i].lastTimeUpdated = millis();
+		blinds[i].commanded = 0;
 	}
 }
 
-void writeBlinds() {
+void saveBlindSettings() {
 	byte pos = 2;
 	EEPROM.write(pos++, numBlinds);
 	for(byte i=0; i<numBlinds; ++i) {
@@ -140,7 +167,8 @@ void writeBlinds() {
 	}
 }
 
-void initOled() {// Prepare the I2C pins
+void initOled() {
+	// Prepare the I2C pins
 	pinMode(7, OUTPUT);
 	digitalWrite(7, LOW);
 	pinMode(8, OUTPUT);
@@ -160,6 +188,8 @@ void initOled() {// Prepare the I2C pins
 	delay(50);
 	oled.setFont(SmallFont);
 	oled.clrscr();
+	oledIsOff = 0;
+	oled.on();
 }
 
 void printPaddedHex(byte num) {
@@ -169,13 +199,31 @@ void printPaddedHex(byte num) {
 	oled.print(num, 16);
 }
 
+void printPaddedPercentage(byte num) {
+	if (num < 10) {
+		oled.print(num);
+		oled.print("%  ");
+	} else if (num < 100) {
+		oled.print(num);
+		oled.print("% ");
+	} else {
+		oled.print(num);
+		oled.print("%");
+	}
+}
+
 // Print the current shutter status on OLED
 void printStatus() {
 	// Save the screen, disable it if nothing is happening.
-	if (abs(millis() - lastInterestingTime) > 60000) {
-		oled.off();
+	if (differsBy(millis(), lastInterestingTime, 60000)) {
+		if (!oledIsOff) {
+			oled.off();
+			oledIsOff = 1;
+		}
 	} else {
-		oled.on();
+		if (oledIsOff) {
+			initOled();
+		}
 	}
 
 	oled.gotoXY(0, 1);
@@ -195,18 +243,22 @@ void printStatus() {
 		printPaddedHex(~blinds[i].addr2);
 		printPaddedHex(~blinds[i].addr1);
 
+		if (blinds[i].isOffline) {
+			oled.println(": offline   ");
+			continue;
+		}
+
 		if (blinds[i].curPercentage == 255) {
 			oled.print(": N/A");
 		} else {
 			oled.print(": ");
-			oled.print(blinds[i].curPercentage, 10);
-			oled.print("%");
+			printPaddedPercentage(blinds[i].curPercentage);
 		}
 
 		if (blinds[i].commanded) {
 			oled.print(" -> ");
-			oled.print(blinds[i].commandedPercent);
-			oled.println("%  ");
+			printPaddedPercentage(blinds[i].commandedPercent);
+			oled.println();
 		} else {
 			oled.println("        ");
 		}
@@ -217,6 +269,7 @@ void sendSomfyMessage(byte msgId, byte *payload, byte payloadLen) {
 	// Reserved byte is always 0xFF
 	// [msgId, 0xFF - len(payload) - 5, reserved] + payload + checksum
 	word checksum = 0;
+	blindsSerial.drain();
 	blindsSerial.startWrite();
 
 	blindsSerial.write(msgId);
@@ -312,11 +365,11 @@ bool readMessage(byte expectedType, byte *resultBuf, byte resultLen) {
 	return checksumOk;
 }
 
-// DISCOVER_ALL
-byte discoverAllPayload[] = {0x80u, 0x80u, 0x80u, 00, 00, 00};
-byte resultBuf[20];
-
 void runDiscoveryAttempt() {
+// DISCOVER_ALL
+	byte discoverAllPayload[] = {0x80u, 0x80u, 0x80u, 00, 00, 00};
+	byte resultBuf[20];
+
 	blindsSerial.drain();
 	sendSomfyMessage(DISCOVER_ALL_MOTORS, discoverAllPayload, 6);
 	delay(100); // We have a nice buffer in the serial library, use it!
@@ -328,15 +381,13 @@ void runDiscoveryAttempt() {
 			initMotor(resultBuf[1], resultBuf[2], resultBuf[3]);
 		}
 	}
-	// Now check motors
-	//readMotorStates();
 }
-
-// GET_MOTOR_STATUS payload buf
-byte getMotorStatus[] = {0x80u, 0x80u, 0x80u, 00, 00, 00};
 
 bool readMotorStates() {
 	bool changed = false;
+	// GET_MOTOR_STATUS payload buf
+	byte getMotorStatus[] = {0x80u, 0x80u, 0x80u, 00, 00, 00};
+	byte resultBuf[24];
 
 	for(byte i=0; i<numBlinds; ++i) {
 		// Interrogate each motor, use retries to compensate for bad network
@@ -349,14 +400,30 @@ bool readMotorStates() {
 			delay(80);
 			if (readMessage(HERE_IS_POSITION, resultBuf, 16)) {
 				byte newPos = 0xFF - resultBuf[9];
-				Serial.print("New pos ");
-				Serial.println(newPos);
+				blinds[i].lastTimeUpdated = millis();
+				blinds[i].isOffline = false;
+
 				if (blinds[i].curPercentage != newPos) {
+					// The shades are moving, so the command was received
+					blinds[i].commandReceived = 1;
+					Serial.print("New pos for blind ");
+					Serial.print(i); Serial.print(" is ");
+					Serial.println(newPos);
 					blinds[i].curPercentage = newPos;
 					changed = true;
 				}
 				break;
 			}
+		}
+
+		// Check for timeouts
+		if (!blinds[i].isOffline &&
+			differsBy(millis(), blinds[i].lastTimeUpdated, OFFLINE_TIMEOUT)) {
+
+			changed = true;
+			Serial.print("Shade "); Serial.print(i);
+			Serial.println(" is offline");
+			blinds[i].isOffline = true;
 		}
 	}
 	return changed;
@@ -390,15 +457,15 @@ void initMotor(byte addr1, byte addr2, byte addr3) {
 	// down if needed.
 	for(byte i=numBlinds; i>insertPos; --i) {
 		// The compiler chokes on structure copy, do it manually
-		blinds[i].addr1 = blinds[i-1].addr1;
-		blinds[i].addr2 = blinds[i-1].addr2;
-		blinds[i].addr3 = blinds[i-1].addr3;
-		blinds[i].curPercentage = blinds[i-1].curPercentage;
+		memcpy(&blinds[i], &blinds[i-1], sizeof(Blinds));
 	}
 	blinds[insertPos].addr1 = addr1;
 	blinds[insertPos].addr2 = addr2;
 	blinds[insertPos].addr3 = addr3;
 	blinds[insertPos].curPercentage = 255;
+	blinds[insertPos].lastTimeUpdated = millis();
+	blinds[insertPos].isOffline = false;
+	blinds[insertPos].commanded = 0;
 	numBlinds++;
 
 	oled.clrscr();
@@ -435,8 +502,27 @@ void checkResetOrInclude() {
 	}
 }
 
-void sendReportThrottled() {
+void sendReportThrottled(bool important) {
+	if (important) {
+		Serial.println("Sending an important report");
+		lastReportSent = millis();
+		zunoSendUncolicitedReport(1);
+		return;
+	}
 
+	// Send the report
+	dword diff;
+	if (!differsBy(lastInterestingTime, millis(), 30000)) {
+		diff = 10000;
+	} else {
+		diff = 300000;
+	}
+
+	if (differsBy(lastReportSent, millis(), diff)) {
+		Serial.println("Sending a routine report");
+		zunoSendUncolicitedReport(1);
+		lastReportSent = millis();
+	}
 }
 
 void real_loop() { // run over and over
@@ -446,7 +532,7 @@ void real_loop() { // run over and over
 		if ((numBlinds != 0 && digitalRead(BTN_PIN) == LOW) ||	numBlinds == MAX_BLINDS) {
 			// Button is pressed - switch into the join mode if
 			// we have at least one shutter discovered.
-			writeBlinds();
+			saveBlindSettings();
 			setMode(JOINING);
 			oled.clrscr();
 			printStatus();
@@ -477,13 +563,25 @@ void real_loop() { // run over and over
 		zunoStartLearn(5, 0);
 	}
 
-	// Avoid polling the motor states too often, once every 6 seconds for normal work.
-	bool shouldReadStates = abs(millis() - lastTimeRead) > 6000 || lastTimeRead == 0;
+	// Avoid polling the motor states too often, once every 600 seconds for normal periods
+	// and once every 6 seconds for interesting events. Also do it while the OLED is on.
+	bool shouldReadStates = lastTimeRead == 0;
+	if (differsBy(millis(), lastInterestingTime, 20000) && oledIsOff) {
+		shouldReadStates |= differsBy(millis(), lastTimeRead, 600000);
+	} else {
+		shouldReadStates |= differsBy(millis(), lastTimeRead, 6000);
+	}
+
 	if (globalMode == OPERATION) {
 		// Process the commands
-		if (processCommandedStatus()) {
+		bool isCommanded = false, shouldReport = false;
+		processCommandedStatus(&isCommanded, &shouldReport);
+		if (isCommanded) {
 			lastInterestingTime = millis();
 			shouldReadStates = true;
+		}
+		if (shouldReport) {
+			sendReportThrottled(true);
 		}
 	}
 
@@ -493,73 +591,109 @@ void real_loop() { // run over and over
 			// Something has changed in the motor states - always treat it as an
 			// interesting event.
 			lastInterestingTime = millis();
-			// Send the report
-			Serial.println("Reporting the change");
-			zunoSendUncolicitedReport(1);
 		}
 		printStatus();
+		sendReportThrottled(false);
 	}
 
 	delay(300);
 }
 
-// Globals to avoid using the stack
-byte moveMotor[] = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFBu, 0, 0xFF, 0xFF};
-
-bool processCommandedStatus() {
-	bool changed = false;
+void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
+	byte moveMotorUp[]   = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFEu, 0xFF, 0xFF, 0xFF};
+	byte moveMotorDown[] = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFFu, 0xFF, 0xFF, 0xFF};
+	byte moveMotor[]     = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFBu, 0,    0xFF, 0xFF};
 
 	for(byte i=0; i<numBlinds; ++i) {
 		if (!blinds[i].commanded) {
 			continue;
 		}
-		changed = true; // We have commanded blinds
+		*hasCommanded = true; // We have commanded blinds, this is always an interesting event
 
-		if (abs(blinds[i].commandedPercent - blinds[i].curPercentage) < 3) {
+		if (!differsBy(blinds[i].commandedPercent,  blinds[i].curPercentage, 3)) {
 			blinds[i].commanded = 0;
+			blinds[i].commandedTime = 0;
+			*shouldSendReport = true;
+			Serial.print("Blind "); Serial.print(i);
+			Serial.println(" has finished moving");
 			continue;
 		}
 
-		Serial.print("Commanding to move to ");
-		Serial.println(blinds[i].commandedPercent);
-		// Send out the command to move
-		moveMotor[3] = blinds[i].addr1;
-		moveMotor[4] = blinds[i].addr2;
-		moveMotor[5] = blinds[i].addr3;
-		moveMotor[7] = 0xFF - blinds[i].commandedPercent;
+		if (differsBy(millis(), blinds[i].commandedTime, 60000)) {
+			Serial.print("Blind "); Serial.print(i);
+			Serial.println(" has timed out while moving");
+			// The command is taking too long - reset the commanded status
+			blinds[i].commanded = 0;
+			blinds[i].commandedTime = 0;
+			*shouldSendReport = true;
+			continue;
+		}
+
+		if (blinds[i].commandReceived) {
+			// No need to send the command multiple times
+			continue;
+		}
+
+		byte msgId, size;
+		byte *msg;
+		Serial.print("Commanding blind "); Serial.print(i);
+		if (blinds[i].commandedPercent <= 6) {
+			// Opening blinds fully
+			Serial.println(" to move up to the limit");
+			msgId = MOVE_MOTOR_TO_LIMIT;
+			msg = moveMotorUp;
+			size = sizeof(moveMotorUp);
+		} else if (blinds[i].commandedPercent >= 94) {
+			// Closing blinds fully
+			Serial.println(" to move down to the limit");
+			msgId = MOVE_MOTOR_TO_LIMIT;
+			msg = moveMotorDown;
+			size = sizeof(moveMotorDown);
+		} else {
+			Serial.print(" to move to position ");
+			Serial.println(blinds[i].commandedPercent);
+			// Send out the command to move
+			msgId = MOVE_MOTOR_TO_POS;
+			msg = moveMotor;
+			msg[7] = 0xFF - blinds[i].commandedPercent;
+			size = sizeof(moveMotor);
+		}
+
+		msg[3] = blinds[i].addr1;
+		msg[4] = blinds[i].addr2;
+		msg[5] = blinds[i].addr3;
 
 		// Send the command multiple times to be sure
 		for(int k=0; k<2; ++k) {
-			sendSomfyMessage(MOVE_MOTOR_TO_POS, moveMotor, sizeof(moveMotor));
+			sendSomfyMessage(msgId, msg, size);
 			delay(40);
 		}
 	}
-
-	return changed;
 }
 
 // ZWave getters
-byte cb_min; // Use global variables because the stack might be busted
-byte cb_i;
 void realZunoCallback(void) {
-//	Serial.println("Callback");
+	byte cb_min, i;
 	switch(callback_data.type) {
 		case ZUNO_CHANNEL1_GETTER:
-			// Get the lowest percentage
 			cb_min = 100;
-			for(cb_i=0; cb_i<numBlinds; ++cb_i) {
-				if (blinds[cb_i].curPercentage < cb_min) {
-					cb_min = blinds[cb_i].curPercentage;
+			for(i=0; i<numBlinds; ++i) {
+				if (blinds[i].curPercentage < cb_min) {
+					cb_min = blinds[i].curPercentage;
 				}
 			}
 			callback_data.param.bParam = cb_min;
 			return;
 		case ZUNO_CHANNEL1_SETTER:
-//			Serial.print("Set to ");
-//			Serial.println(callback_data.param.bParam);
-			for(cb_i=0; cb_i<numBlinds; ++cb_i) {
-				blinds[cb_i].commanded = 1;
-				blinds[cb_i].commandedPercent = min(100, callback_data.param.bParam);
+			for(i=0; i<numBlinds; ++i) {
+				blinds[i].commanded = 1;
+				blinds[i].commandedPercent = min(100, callback_data.param.bParam);
+				// Clamp to 100%
+				if (blinds[i].commandedPercent > 97) {
+					blinds[i].commandedPercent = 100;
+				}
+				blinds[i].commandedTime = millis();
+				blinds[i].commandReceived = 0;
 			}
 			return;
 		default:
@@ -567,16 +701,21 @@ void realZunoCallback(void) {
 	}
 
 	// Try to check getters/setters for individual channels
-	for(cb_i=0; cb_i<numBlinds; ++cb_i) {
+	for(i=0; i<numBlinds; ++i) {
 		// Getter for one of the blinds
-		if (callback_data.type == ((cb_i+1) << 1)) {
-			callback_data.param.bParam = blinds[cb_i].curPercentage;
+		// See the definition of ZUNO_CHANNEL1_GETTER for context
+		if (callback_data.type == ((i+1) << 1)) {
+			callback_data.param.bParam = blinds[i].curPercentage;
 			return;
 		}
 		// Setter
-		if (callback_data.type == (((cb_i+1) << 1) | SETTER_BIT)) {
-			blinds[cb_i].commanded = 1;
-			blinds[cb_i].commandedPercent = min(100, callback_data.param.bParam);
+		// See the definition of ZUNO_CHANNEL1_SETTER for context
+		if (callback_data.type == (((i+1) << 1) | SETTER_BIT)) {
+			blinds[i].commanded = 1;
+			blinds[i].commandedPercent = min(100, callback_data.param.bParam);
+			blinds[i].commandedTime = millis();
+			blinds[i].commandReceived = 0;
+			return;
 		}
 	}
 }
