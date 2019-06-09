@@ -252,12 +252,12 @@ void printStatus() {
 			oled.print(": N/A");
 		} else {
 			oled.print(": ");
-			printPaddedPercentage(blinds[i].curPercentage);
+			printPaddedPercentage(100 - blinds[i].curPercentage);
 		}
 
 		if (blinds[i].commanded) {
 			oled.print(" -> ");
-			printPaddedPercentage(blinds[i].commandedPercent);
+			printPaddedPercentage(100 - blinds[i].commandedPercent);
 			oled.println();
 		} else {
 			oled.println("        ");
@@ -610,7 +610,7 @@ void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
 		}
 		*hasCommanded = true; // We have commanded blinds, this is always an interesting event
 
-		if (!differsBy(blinds[i].commandedPercent,  blinds[i].curPercentage, 3)) {
+		if (!differsBy(blinds[i].commandedPercent, blinds[i].curPercentage, 2)) {
 			blinds[i].commanded = 0;
 			blinds[i].commandedTime = 0;
 			*shouldSendReport = true;
@@ -620,12 +620,12 @@ void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
 		}
 
 		if (differsBy(millis(), blinds[i].commandedTime, 60000)) {
-			Serial.print("Blind "); Serial.print(i);
-			Serial.println(" has timed out while moving");
 			// The command is taking too long - reset the commanded status
 			blinds[i].commanded = 0;
 			blinds[i].commandedTime = 0;
 			*shouldSendReport = true;
+			Serial.print("Blind "); Serial.print(i);
+			Serial.println(" has timed out while moving");
 			continue;
 		}
 
@@ -637,13 +637,13 @@ void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
 		byte msgId, size;
 		byte *msg;
 		Serial.print("Commanding blind "); Serial.print(i);
-		if (blinds[i].commandedPercent <= 6) {
+		if (blinds[i].commandedPercent == 0) {
 			// Opening blinds fully
 			Serial.println(" to move up to the limit");
 			msgId = MOVE_MOTOR_TO_LIMIT;
 			msg = moveMotorUp;
 			size = sizeof(moveMotorUp);
-		} else if (blinds[i].commandedPercent >= 94) {
+		} else if (blinds[i].commandedPercent == 99) {
 			// Closing blinds fully
 			Serial.println(" to move down to the limit");
 			msgId = MOVE_MOTOR_TO_LIMIT;
@@ -673,25 +673,23 @@ void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
 
 // ZWave getters
 void realZunoCallback(void) {
-	byte cb_min, i;
+	byte cb_max, i;
 	switch(callback_data.type) {
 		case ZUNO_CHANNEL1_GETTER:
-			cb_min = 100;
+			cb_max = 0;
 			for(i=0; i<numBlinds; ++i) {
-				if (blinds[i].curPercentage < cb_min) {
-					cb_min = blinds[i].curPercentage;
+				if (blinds[i].curPercentage > cb_max) {
+					cb_max = blinds[i].curPercentage;
 				}
 			}
-			callback_data.param.bParam = cb_min;
+			callback_data.param.bParam = 99 - min(99, cb_max);
 			return;
 		case ZUNO_CHANNEL1_SETTER:
+			Serial.print("Received command for all blinds ");
+			Serial.print(" to move to "); Serial.println(callback_data.param.bParam);
 			for(i=0; i<numBlinds; ++i) {
+				blinds[i].commandedPercent = 99 - min(99, callback_data.param.bParam);
 				blinds[i].commanded = 1;
-				blinds[i].commandedPercent = min(100, callback_data.param.bParam);
-				// Clamp to 100%
-				if (blinds[i].commandedPercent > 97) {
-					blinds[i].commandedPercent = 100;
-				}
 				blinds[i].commandedTime = millis();
 				blinds[i].commandReceived = 0;
 			}
@@ -705,14 +703,17 @@ void realZunoCallback(void) {
 		// Getter for one of the blinds
 		// See the definition of ZUNO_CHANNEL1_GETTER for context
 		if (callback_data.type == ((i+1) << 1)) {
-			callback_data.param.bParam = blinds[i].curPercentage;
+			callback_data.param.bParam = 99 - min(99, blinds[i].curPercentage);
 			return;
 		}
 		// Setter
 		// See the definition of ZUNO_CHANNEL1_SETTER for context
 		if (callback_data.type == (((i+1) << 1) | SETTER_BIT)) {
+			Serial.print("Received direct command for blinds "); Serial.print(i);
+			Serial.print(" to "); Serial.println(callback_data.param.bParam);
+
+			blinds[i].commandedPercent = 99 - min(99, callback_data.param.bParam);
 			blinds[i].commanded = 1;
-			blinds[i].commandedPercent = min(100, callback_data.param.bParam);
 			blinds[i].commandedTime = millis();
 			blinds[i].commandReceived = 0;
 			return;
