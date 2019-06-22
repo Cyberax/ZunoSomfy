@@ -4,10 +4,12 @@
 
 #define MAX_RCV_BUFFER 128 // !!! HAVE to be 2^n
 
+// Bit-banged software serial port with negative parity support.
+// It uses global variables under the hood, so only one instance of this class
+// can exist.
 class OddSoftSer : public Stream
 {
 private:
-	word m_baud;
 	word bit_time;
 	s_pin m_tx_pin;
 
@@ -16,8 +18,6 @@ public:
 	OddSoftSer(s_pin tx_pin, s_pin rx_pin);
 
 	void begin(word baud);
-
-	void end();
 
 	virtual uint8_t available(void);
 
@@ -29,28 +29,6 @@ public:
 
 	virtual void write(uint8_t);
 
-	void startWrite();
-	void endWrite();
-
+	// Clear the input buffer
 	void drain();
-
-	uint8_t write(unsigned long n) {
-		write((uint8_t) n);
-		return 1;
-	}
-
-	uint8_t write(long n) {
-		write((uint8_t) n);
-		return 1;
-	}
-
-	uint8_t write(unsigned int n) {
-		write((uint8_t) n);
-		return 1;
-	}
-
-	uint8_t write(int n) {
-		write((uint8_t) n);
-		return 1;
-	}
 };

@@ -26,6 +26,8 @@ ZUNO_SETUP_ISR_GPTIMER(softserial_gpt_handler);
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "OCUnusedGlobalDeclarationInspection"
 
+// Since we can't really access the software serial instance, we just use
+// global variables in the interrupt handler.
 void softserial_gpt_handler() {
 	if (g_rcv_state == START_BIT_1HALF) {
 		if (!digitalRead(g_rx_pin)) {
@@ -84,8 +86,6 @@ void OddSoftSer::begin(word baud) {
 	pinMode(DIRECTION_CONTROL_PIN, OUTPUT);
 	digitalWrite(DIRECTION_CONTROL_PIN, LOW);
 
-	m_baud = baud;
-
 	// Set up the timer interrupt for reading
 	dword ticks = 4000000L; // Each tick is a 0.25uS
 	ticks /= (baud * 2);
@@ -102,10 +102,6 @@ void OddSoftSer::begin(word baud) {
 	bit_time -= CONST_USECONDS_OFFSET;
 	pinMode(m_tx_pin, OUTPUT);
 	digitalWrite(m_tx_pin, HIGH);
-}
-
-void OddSoftSer::end() {
-	zunoGPTEnable(0);
 }
 
 uint8_t OddSoftSer::available(void) {
@@ -135,14 +131,6 @@ uint8_t OddSoftSer::read(void) {
 }
 
 void OddSoftSer::flush(void) {
-}
-
-void OddSoftSer::startWrite() {
-//	noInterrupts();
-}
-
-void OddSoftSer::endWrite() {
-//	interrupts();
 }
 
 void OddSoftSer::write(uint8_t d) {

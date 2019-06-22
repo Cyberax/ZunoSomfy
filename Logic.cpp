@@ -270,7 +270,6 @@ void sendSomfyMessage(byte msgId, byte *payload, byte payloadLen) {
 	// [msgId, 0xFF - len(payload) - 5, reserved] + payload + checksum
 	word checksum = 0;
 	blindsSerial.drain();
-	blindsSerial.startWrite();
 
 	blindsSerial.write(msgId);
 	checksum += msgId;
@@ -288,8 +287,6 @@ void sendSomfyMessage(byte msgId, byte *payload, byte payloadLen) {
 
 	blindsSerial.write(byte(checksum / 256));
 	blindsSerial.write(byte(checksum % 256));
-
-	blindsSerial.endWrite();
 }
 
 // Read the next byte from the serial, obeying the total time budget
