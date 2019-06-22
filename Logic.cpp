@@ -31,7 +31,8 @@ struct Blinds {
 	byte curPercentage;
 
 	// Commanded position
-	byte commanded, commandedPercent, commandReceived;
+	byte commanded, commandedPercent;
+	byte commandSent, commandAcked;
 	dword commandedTime;
 
 	// Health status
@@ -47,7 +48,7 @@ byte numBlinds = 0;
 // The global mode
 enum mode_t {DISCOVERY, JOINING, OPERATION};
 mode_t globalMode;
-dword lastInterestingTime, lastTimeRead;
+dword lastInterestingTime, lastTimeRead, learningStarted;
 dword lastReportSent;
 byte oledIsOff;
 
@@ -89,6 +90,7 @@ void real_setup() {
 	Serial.begin(19200);
 
 	lastReportSent = 0;
+	learningStarted = 0;
 
 	my_memzero(blinds, sizeof(Blinds)*MAX_BLINDS);
 	readMode();
@@ -402,7 +404,9 @@ bool readMotorStates() {
 
 				if (blinds[i].curPercentage != newPos) {
 					// The shades are moving, so the command was received
-					blinds[i].commandReceived = 1;
+					if (blinds[i].commandSent) {
+						blinds[i].commandAcked = 1;
+					}
 					Serial.print("New pos for blind ");
 					Serial.print(i); Serial.print(" is ");
 					Serial.println(newPos);
@@ -483,7 +487,7 @@ void checkResetOrInclude() {
 	if (diff > 2000 && diff < 6000) {
 		oled.clrscr();
 		oled.println("Learning");
-		zunoStartLearn(10, 0);
+		zunoStartLearn(20, 0);
 		oled.clrscr();
 	}
 
@@ -557,7 +561,12 @@ void real_loop() { // run over and over
 			return;
 		}
 		// Start the unsecure inclusion
-		zunoStartLearn(5, 0);
+		if (learningStarted == 0) { //|| differsBy(millis(), learningStarted, 15000)) {
+			zunoStartLearn(10, 0);
+			learningStarted = 1; //millis()+1;
+		}
+		delay(500);
+		return;
 	}
 
 	// Avoid polling the motor states too often, once every 600 seconds for normal periods
@@ -626,7 +635,7 @@ void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
 			continue;
 		}
 
-		if (blinds[i].commandReceived) {
+		if (blinds[i].commandSent && blinds[i].commandAcked) {
 			// No need to send the command multiple times
 			continue;
 		}
@@ -665,6 +674,7 @@ void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
 			sendSomfyMessage(msgId, msg, size);
 			delay(40);
 		}
+		blinds[i].commandSent = 1;
 	}
 }
 
@@ -688,7 +698,7 @@ void realZunoCallback(void) {
 				blinds[i].commandedPercent = 99 - min(99, callback_data.param.bParam);
 				blinds[i].commanded = 1;
 				blinds[i].commandedTime = millis();
-				blinds[i].commandReceived = 0;
+				blinds[i].commandSent = blinds[i].commandAcked = 0;
 			}
 			return;
 		default:
@@ -712,7 +722,7 @@ void realZunoCallback(void) {
 			blinds[i].commandedPercent = 99 - min(99, callback_data.param.bParam);
 			blinds[i].commanded = 1;
 			blinds[i].commandedTime = millis();
-			blinds[i].commandReceived = 0;
+			blinds[i].commandSent = blinds[i].commandAcked = 0;
 			return;
 		}
 	}
