@@ -565,9 +565,9 @@ void real_loop() { // run over and over
 			return;
 		}
 		// Start the unsecure inclusion
-		if (learningStarted == 0) { //|| differsBy(millis(), learningStarted, 15000)) {
+		if (learningStarted == 0) {
 			zunoStartLearn(10, 0);
-			learningStarted = 1; //millis()+1;
+			learningStarted = 1;
 		}
 		delay(500);
 		return;
@@ -613,6 +613,7 @@ void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
 	byte moveMotorUp[]   = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFEu, 0xFF, 0xFF, 0xFF};
 	byte moveMotorDown[] = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFFu, 0xFF, 0xFF, 0xFF};
 	byte moveMotor[]     = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFBu, 0,    0xFF, 0xFF};
+	bool commandSent = false;
 
 	for(byte i=0; i<numBlinds; ++i) {
 		if (!blinds[i].commanded) {
@@ -679,12 +680,18 @@ void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
 			delay(40);
 		}
 		blinds[i].commandSent = 1;
+		commandSent = true;
+	}
+	if (commandSent) {
+		delay(100); // Delay to allow Somfy to process the messages
+		blindsSerial.drain();
 	}
 }
 
 // ZWave getters
 void realZunoCallback(void) {
 	byte cb_max, i;
+	bool anyCommanded = false;
 	switch(callback_data.type) {
 		case ZUNO_CHANNEL1_GETTER:
 			cb_max = 0;
@@ -697,12 +704,20 @@ void realZunoCallback(void) {
 			return;
 		case ZUNO_CHANNEL1_SETTER:
 			Serial.print("Received command for all blinds ");
-			Serial.print(" to move to "); Serial.println(callback_data.param.bParam);
+			Serial.print("to move to "); Serial.println(callback_data.param.bParam);
 			for(i=0; i<numBlinds; ++i) {
-				blinds[i].commandedPercent = 99 - min(99, callback_data.param.bParam);
+				int cmd = 99 - min(99, callback_data.param.bParam);
+				if (blinds[i].commandedPercent == cmd && blinds[i].commanded) {
+					continue;
+				}
+				anyCommanded = true;
+				blinds[i].commandedPercent = cmd;
 				blinds[i].commanded = 1;
 				blinds[i].commandedTime = millis();
 				blinds[i].commandSent = blinds[i].commandAcked = 0;
+			}
+			if (anyCommanded) {
+				Serial.println("Command was sent to at least one motor");
 			}
 			return;
 		default:
@@ -720,10 +735,14 @@ void realZunoCallback(void) {
 		// Setter
 		// See the definition of ZUNO_CHANNEL1_SETTER for context
 		if (callback_data.type == (((i+1) << 1) | SETTER_BIT)) {
+			int cmd = 99 - min(99, callback_data.param.bParam);
+			if (blinds[i].commandedPercent == cmd && blinds[i].commanded) {
+				continue;
+			}
+
 			Serial.print("Received direct command for blinds "); Serial.print(i);
 			Serial.print(" to "); Serial.println(callback_data.param.bParam);
-
-			blinds[i].commandedPercent = 99 - min(99, callback_data.param.bParam);
+			blinds[i].commandedPercent = cmd;
 			blinds[i].commanded = 1;
 			blinds[i].commandedTime = millis();
 			blinds[i].commandSent = blinds[i].commandAcked = 0;
