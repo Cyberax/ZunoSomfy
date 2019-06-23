@@ -388,6 +388,7 @@ bool readMotorStates() {
 	byte getMotorStatus[] = {0x80u, 0x80u, 0x80u, 00, 00, 00};
 	byte resultBuf[24];
 
+	Serial.println("Reading blinds stats");
 	for(byte i=0; i<numBlinds; ++i) {
 		// Interrogate each motor, use retries to compensate for bad network
 		getMotorStatus[3] = blinds[i].addr1;
@@ -400,7 +401,10 @@ bool readMotorStates() {
 			if (readMessage(HERE_IS_POSITION, resultBuf, 16)) {
 				byte newPos = 0xFF - resultBuf[9];
 				blinds[i].lastTimeUpdated = millis();
-				blinds[i].isOffline = false;
+				if (blinds[i].isOffline) {
+					blinds[i].isOffline = false;
+					changed = true;
+				}
 
 				if (blinds[i].curPercentage != newPos) {
 					// The shades are moving, so the command was received
