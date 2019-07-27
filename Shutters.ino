@@ -1,8 +1,13 @@
-//#include "OddSoftSer.h"
-#include "Logic.h"
-
 ZUNO_SETUP_SLEEPING_MODE(ZUNO_SLEEPING_MODE_ALWAYS_AWAKE);
 ZUNO_SETUP_DEBUG_MODE(DEBUG_ON);
+ZUNO_DYNAMIC_CHANNELS(32);
+
+ZUNO_ENABLE(WITH_CC_SWITCH_MULTILEVEL);
+ZUNO_DISABLE(SERVICE_LEDS);
+
+//WITH_GENERAL_CHANNEL_VALUES
+//#include "OddSoftSer.h"
+#include "Logic.h"
 
 void setup() {
   real_setup();
@@ -10,8 +15,4 @@ void setup() {
 
 void loop() { // run over and over
 	real_loop();
-}
-
-void zunoCallback(void) {
-	realZunoCallback();
 }

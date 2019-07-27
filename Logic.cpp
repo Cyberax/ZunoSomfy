@@ -88,6 +88,7 @@ void real_setup() {
 	blindsSerial.begin(4800);
 	// Debug serial
 	Serial.begin(19200);
+	Serial.println("Initializing");
 
 	lastReportSent = 0;
 	learningStarted = 0;
@@ -99,14 +100,6 @@ void real_setup() {
 		setupChannels();
 	} else {
 		numBlinds = 0;
-	}
-
-	// Disable the green LED in the ops mode
-	if (globalMode == OPERATION){
-		word val = 0;
-		zunoSaveCFGParam(2, &val);
-		val = 5;
-		zunoSaveCFGParam(11, &val);
 	}
 
 	printStatus();
@@ -122,11 +115,19 @@ bool differsBy(dword v1, dword v2, dword diff) {
 void setupChannels() {
 	ZUNO_START_CONFIG();
 	// The overall switch
+	#define MAP_TO_ZEROCHANNEL 0x80u
+	ZUNO_SET_ZWCHANNEL(1u | MAP_TO_ZEROCHANNEL) // <- this channel will be provided via 1 & 0 channels
 	ZUNO_ADD_CHANNEL(ZUNO_SWITCH_MULTILEVEL_CHANNEL_NUMBER, 0, 0)
+
 	for(byte i=0; i<numBlinds; ++i) {
+		ZUNO_SET_ZWCHANNEL(i+2)
 		ZUNO_ADD_CHANNEL(ZUNO_SWITCH_MULTILEVEL_CHANNEL_NUMBER, 0, 0)
 	}
 	ZUNO_COMMIT_CONFIG();
+}
+
+void updateServiceLed() {
+
 }
 
 void readMode() {
@@ -134,6 +135,9 @@ void readMode() {
 	if (globalMode > OPERATION) {
 		globalMode = DISCOVERY;
 	}
+	Serial.print("Read mode ");
+	Serial.println(globalMode);
+	updateServiceLed();
 }
 
 void setMode(mode_t mode) {
@@ -141,6 +145,7 @@ void setMode(mode_t mode) {
 		EEPROM.write(1, mode);
 		globalMode = mode;
 	}
+	updateServiceLed();
 }
 
 void loadBlinds() {
@@ -530,6 +535,63 @@ void sendReportThrottled(bool important) {
 	}
 }
 
+void updateZwaveValues() {
+	// Compute the current max value across all blinds
+	// and present it as the channel 1
+	byte cb_max = 0;
+	for (byte i = 0; i < numBlinds; ++i) {
+		if (blinds[i].curPercentage > cb_max) {
+			cb_max = blinds[i].curPercentage;
+		}
+	}
+	g_channels_data[0].bParam = 99 - min(99, cb_max);
+
+	// Now set the direct values
+	for (byte i = 0; i < numBlinds; ++i) {
+		g_channels_data[i + 1].bParam = 99 - min(99, blinds[i].curPercentage);
+	}
+}
+
+void checkZwaveSetters() {
+	if (zunoIsChannelUpdated(1)) {
+		Serial.print("Received command for all blinds ");
+		Serial.print("to move to "); Serial.println(g_channels_data[0].bParam);
+		byte anyCommanded = false;
+		for(byte i=0; i<numBlinds; ++i) {
+			int cmd = 99 - min(99, g_channels_data[0].bParam);
+			if (blinds[i].commandedPercent == cmd && blinds[i].commanded) {
+				continue;
+			}
+			anyCommanded = true;
+			blinds[i].commandedPercent = cmd;
+			blinds[i].commanded = 1;
+			blinds[i].commandedTime = millis();
+			blinds[i].commandSent = blinds[i].commandAcked = 0;
+		}
+		if (anyCommanded) {
+			Serial.println("Command was sent to at least one motor");
+		}
+	}
+
+	// Try to check getters/setters for individual channels
+	for(byte i=0; i<numBlinds; ++i) {
+		if (zunoIsChannelUpdated(i+2)) {
+			int cmd = 99 - min(99, g_channels_data[i+1].bParam);
+			if (blinds[i].commandedPercent == cmd && blinds[i].commanded) {
+				continue;
+			}
+
+			Serial.print("Received direct command for blinds "); Serial.print(i);
+			Serial.print(" to "); Serial.println(g_channels_data[i+1].bParam);
+			blinds[i].commandedPercent = cmd;
+			blinds[i].commanded = 1;
+			blinds[i].commandedTime = millis();
+			blinds[i].commandSent = blinds[i].commandAcked = 0;
+			return;
+		}
+	}
+}
+
 void real_loop() { // run over and over
 	if (globalMode == DISCOVERY) {
 		runDiscoveryAttempt();
@@ -572,6 +634,10 @@ void real_loop() { // run over and over
 		delay(500);
 		return;
 	}
+
+	// Interact with Zwave
+	checkZwaveSetters();
+	updateZwaveValues();
 
 	// Avoid polling the motor states too often, once every 600 seconds for normal periods
 	// and once every 6 seconds for interesting events. Also do it while the OLED is on.
@@ -685,69 +751,6 @@ void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
 	if (commandSent) {
 		delay(100); // Delay to allow Somfy to process the messages
 		blindsSerial.drain();
-	}
-}
-
-// ZWave getters
-void realZunoCallback(void) {
-	byte cb_max, i;
-	bool anyCommanded = false;
-	switch(callback_data.type) {
-		case ZUNO_CHANNEL1_GETTER:
-			cb_max = 0;
-			for(i=0; i<numBlinds; ++i) {
-				if (blinds[i].curPercentage > cb_max) {
-					cb_max = blinds[i].curPercentage;
-				}
-			}
-			callback_data.param.bParam = 99 - min(99, cb_max);
-			return;
-		case ZUNO_CHANNEL1_SETTER:
-			Serial.print("Received command for all blinds ");
-			Serial.print("to move to "); Serial.println(callback_data.param.bParam);
-			for(i=0; i<numBlinds; ++i) {
-				int cmd = 99 - min(99, callback_data.param.bParam);
-				if (blinds[i].commandedPercent == cmd && blinds[i].commanded) {
-					continue;
-				}
-				anyCommanded = true;
-				blinds[i].commandedPercent = cmd;
-				blinds[i].commanded = 1;
-				blinds[i].commandedTime = millis();
-				blinds[i].commandSent = blinds[i].commandAcked = 0;
-			}
-			if (anyCommanded) {
-				Serial.println("Command was sent to at least one motor");
-			}
-			return;
-		default:
-			break;
-	}
-
-	// Try to check getters/setters for individual channels
-	for(i=0; i<numBlinds; ++i) {
-		// Getter for one of the blinds
-		// See the definition of ZUNO_CHANNEL1_GETTER for context
-		if (callback_data.type == ((i+1) << 1)) {
-			callback_data.param.bParam = 99 - min(99, blinds[i].curPercentage);
-			return;
-		}
-		// Setter
-		// See the definition of ZUNO_CHANNEL1_SETTER for context
-		if (callback_data.type == (((i+1) << 1) | SETTER_BIT)) {
-			int cmd = 99 - min(99, callback_data.param.bParam);
-			if (blinds[i].commandedPercent == cmd && blinds[i].commanded) {
-				continue;
-			}
-
-			Serial.print("Received direct command for blinds "); Serial.print(i);
-			Serial.print(" to "); Serial.println(callback_data.param.bParam);
-			blinds[i].commandedPercent = cmd;
-			blinds[i].commanded = 1;
-			blinds[i].commandedTime = millis();
-			blinds[i].commandSent = blinds[i].commandAcked = 0;
-			return;
-		}
 	}
 }
 
