@@ -100,8 +100,10 @@ mechanically easy to work with.
 ### Serial port connection
 
 First, set up the Z-Uno shield to operate in RS-485 mode by following the directions in the
-manual. We can not use the built-in UART because of a highly unusual serial mode used by Somfy.
-The clearly designed set the settings to confuse potential adversaries in case of alien invasion.
+manual. We can not use the built-in UART because of a highly unusual serial mode used by 
+Somfy: 4800 baud, with odd parity.
+
+They quite clearly designed the settings to confuse potential adversaries in case of alien invasion.
 
 So we need to work around this by connecting *pin 7* to *pin 16* and *pin 8* to *pin 15*.
 Then we can set up software serial with the required odd parity calculations on 

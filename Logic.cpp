@@ -34,6 +34,9 @@ struct Blinds {
 	byte commanded, commandedPercent;
 	byte commandSent, commandAcked;
 	dword commandedTime;
+	// Jamming detection
+	dword lastChangedTime, lastPosition;
+	dword unjamTryCount, lastUnjamTryTime;
 
 	// Health status
 	dword lastTimeUpdated;
@@ -422,6 +425,13 @@ bool readMotorStates() {
 					blinds[i].curPercentage = newPos;
 					changed = true;
 				}
+				// Update the jamming detection timestamps
+				if (blinds[i].lastPosition != newPos) {
+					blinds[i].lastPosition = newPos;
+					blinds[i].lastChangedTime = millis();
+					blinds[i].unjamTryCount = 0;
+					blinds[i].lastUnjamTryTime = 0;
+				}
 				break;
 			}
 		}
@@ -592,6 +602,32 @@ void checkZwaveSetters() {
 	}
 }
 
+void detectJams() {
+	dword now = millis();
+
+	for(byte i=0; i<numBlinds; ++i) {
+		if (!blinds[i].commanded) {
+			continue;
+		}
+		if (!differsBy(blinds[i].lastChangedTime, now, 4000)) {
+			// The blinds are still moving, nothing to do
+			continue;
+		}
+		if (blinds[i].unjamTryCount > 10) {
+			// We've failed too many times
+			continue;
+		}
+		if (!differsBy(blinds[i].lastUnjamTryTime, now, 2000)){
+			// Don't spam shutters
+			continue;
+		}
+
+		blinds[i].commandSent = blinds[i].commandAcked = 0; // Force the re-send of the command
+		blinds[i].lastUnjamTryTime = now;
+		blinds[i].unjamTryCount++;
+	}
+}
+
 void real_loop() { // run over and over
 	if (globalMode == DISCOVERY) {
 		runDiscoveryAttempt();
@@ -640,12 +676,12 @@ void real_loop() { // run over and over
 	updateZwaveValues();
 
 	// Avoid polling the motor states too often, once every 600 seconds for normal periods
-	// and once every 6 seconds for interesting events. Also do it while the OLED is on.
+	// and once every 1 second for interesting events. Also do it while the OLED is on.
 	bool shouldReadStates = lastTimeRead == 0;
 	if (differsBy(millis(), lastInterestingTime, 20000) && oledIsOff) {
 		shouldReadStates |= differsBy(millis(), lastTimeRead, 600000);
 	} else {
-		shouldReadStates |= differsBy(millis(), lastTimeRead, 6000);
+		shouldReadStates |= differsBy(millis(), lastTimeRead, 1000);
 	}
 
 	if (globalMode == OPERATION) {
@@ -669,16 +705,56 @@ void real_loop() { // run over and over
 			lastInterestingTime = millis();
 		}
 		printStatus();
+		detectJams();
 		sendReportThrottled(false);
 	}
 
 	delay(300);
 }
 
-void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
+void sendMoveCommands(int i){
 	byte moveMotorUp[]   = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFEu, 0xFF, 0xFF, 0xFF};
 	byte moveMotorDown[] = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFFu, 0xFF, 0xFF, 0xFF};
 	byte moveMotor[]     = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFBu, 0,    0xFF, 0xFF};
+
+	byte msgId, size;
+	byte *msg;
+	Serial.print("Commanding blind "); Serial.print(i);
+	if (blinds[i].commandedPercent == 0) {
+		// Opening blinds fully
+		Serial.println(" to move up to the limit");
+		msgId = MOVE_MOTOR_TO_LIMIT;
+		msg = moveMotorUp;
+		size = sizeof(moveMotorUp);
+	} else if (blinds[i].commandedPercent == 99) {
+		// Closing blinds fully
+		Serial.println(" to move down to the limit");
+		msgId = MOVE_MOTOR_TO_LIMIT;
+		msg = moveMotorDown;
+		size = sizeof(moveMotorDown);
+	} else {
+		Serial.print(" to move to position ");
+		Serial.println(blinds[i].commandedPercent);
+		// Send out the command to move
+		msgId = MOVE_MOTOR_TO_POS;
+		msg = moveMotor;
+		msg[7] = 0xFF - blinds[i].commandedPercent;
+		size = sizeof(moveMotor);
+	}
+
+	msg[3] = blinds[i].addr1;
+	msg[4] = blinds[i].addr2;
+	msg[5] = blinds[i].addr3;
+
+	// Send the command multiple times to be sure
+	for(int k=0; k<2; ++k) {
+		sendSomfyMessage(msgId, msg, size);
+		delay(40);
+	}
+	blinds[i].commandSent = 1;
+}
+
+void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
 	bool commandSent = false;
 
 	for(byte i=0; i<numBlinds; ++i) {
@@ -711,43 +787,10 @@ void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
 			continue;
 		}
 
-		byte msgId, size;
-		byte *msg;
-		Serial.print("Commanding blind "); Serial.print(i);
-		if (blinds[i].commandedPercent == 0) {
-			// Opening blinds fully
-			Serial.println(" to move up to the limit");
-			msgId = MOVE_MOTOR_TO_LIMIT;
-			msg = moveMotorUp;
-			size = sizeof(moveMotorUp);
-		} else if (blinds[i].commandedPercent == 99) {
-			// Closing blinds fully
-			Serial.println(" to move down to the limit");
-			msgId = MOVE_MOTOR_TO_LIMIT;
-			msg = moveMotorDown;
-			size = sizeof(moveMotorDown);
-		} else {
-			Serial.print(" to move to position ");
-			Serial.println(blinds[i].commandedPercent);
-			// Send out the command to move
-			msgId = MOVE_MOTOR_TO_POS;
-			msg = moveMotor;
-			msg[7] = 0xFF - blinds[i].commandedPercent;
-			size = sizeof(moveMotor);
-		}
-
-		msg[3] = blinds[i].addr1;
-		msg[4] = blinds[i].addr2;
-		msg[5] = blinds[i].addr3;
-
-		// Send the command multiple times to be sure
-		for(int k=0; k<2; ++k) {
-			sendSomfyMessage(msgId, msg, size);
-			delay(40);
-		}
-		blinds[i].commandSent = 1;
+		sendMoveCommands(i);
 		commandSent = true;
 	}
+
 	if (commandSent) {
 		delay(100); // Delay to allow Somfy to process the messages
 		blindsSerial.drain();
