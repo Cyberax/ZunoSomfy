@@ -19,6 +19,7 @@ OLED oled;
 #define HERE_IS_MOTOR 0x9Fu
 #define HERE_IS_POSITION 0xF2u
 #define MOVE_MOTOR_TO_LIMIT 0xFCu
+#define STOP_MOTOR 0xFDu
 
 //#define DEBUG_PRINT
 
@@ -29,6 +30,9 @@ struct Blinds {
 //	// Min and max settings (in ticks)
 //	word minPos, maxPos;
 	byte curPercentage;
+
+  // Stop signal
+  byte stopCommanded;
 
 	// Commanded position
 	byte commanded, commandedPercent;
@@ -80,6 +84,10 @@ void my_memzero(void *ptr, word sz) {
 }
 
 void real_setup() {
+  // Debug serial
+    Serial.begin(115200);
+    Serial.println("Initializing");
+
 	initOled();
 	pinMode(BTN_PIN, INPUT_PULLUP);  // set button pin as Input
 
@@ -89,9 +97,6 @@ void real_setup() {
 
 	// Set up the software serial for blinds communication
 	blindsSerial.begin(4800);
-	// Debug serial
-	Serial.begin(19200);
-	Serial.println("Initializing");
 
 	lastReportSent = 0;
 	learningStarted = 0;
@@ -117,14 +122,15 @@ bool differsBy(dword v1, dword v2, dword diff) {
 
 void setupChannels() {
 	ZUNO_START_CONFIG();
-	// The overall switch
-	#define MAP_TO_ZEROCHANNEL 0x80u
-	ZUNO_SET_ZWCHANNEL(1u | MAP_TO_ZEROCHANNEL) // <- this channel will be provided via 1 & 0 channels
-	ZUNO_ADD_CHANNEL(ZUNO_SWITCH_MULTILEVEL_CHANNEL_NUMBER, 0, 0)
+	// The overall switch - it maps to the main endpoint of the device
+	#define MAP_TO_ZEROCHANNEL 0x80u  
+	ZUNO_SET_ZWCHANNEL(MAP_TO_ZEROCHANNEL | 1)
+	ZUNO_ADD_CHANNEL(ZUNO_BLINDS_CHANNEL_NUMBER, 0, 0)
 
+  // Add channels for individual blinds
 	for(byte i=0; i<numBlinds; ++i) {
 		ZUNO_SET_ZWCHANNEL(i+2)
-		ZUNO_ADD_CHANNEL(ZUNO_SWITCH_MULTILEVEL_CHANNEL_NUMBER, 0, 0)
+		ZUNO_ADD_CHANNEL(ZUNO_BLINDS_CHANNEL_NUMBER, 0, 0)
 	}
 	ZUNO_COMMIT_CONFIG();
 }
@@ -396,7 +402,6 @@ bool readMotorStates() {
 	byte getMotorStatus[] = {0x80u, 0x80u, 0x80u, 00, 00, 00};
 	byte resultBuf[24];
 
-	Serial.println("Reading blinds stats");
 	for(byte i=0; i<numBlinds; ++i) {
 		// Interrogate each motor, use retries to compensate for bad network
 		getMotorStatus[3] = blinds[i].addr1;
@@ -454,7 +459,7 @@ void initMotor(byte addr1, byte addr2, byte addr3) {
 		return;
 	}
 
-	byte insertPos = 0;
+	byte insertPos = numBlinds;
 	for(byte i=0; i<numBlinds; ++i) {
 		if (blinds[i].addr1 == addr1 && blinds[i].addr2 == addr2 &&
 			blinds[i].addr3 == addr3) {
@@ -525,8 +530,11 @@ void checkResetOrInclude() {
 void sendReportThrottled(bool important) {
 	if (important) {
 		Serial.println("Sending an important report");
-		lastReportSent = millis();
+		lastReportSent = millis();    
 		zunoSendUncolicitedReport(1);
+    for(int i = 0; i < numBlinds; i++) {
+      zunoSendUncolicitedReport(i+2);
+    }
 		return;
 	}
 
@@ -541,6 +549,9 @@ void sendReportThrottled(bool important) {
 	if (differsBy(lastReportSent, millis(), diff)) {
 		Serial.println("Sending a routine report");
 		zunoSendUncolicitedReport(1);
+    for(int i = 0; i < numBlinds; i++) {
+      zunoSendUncolicitedReport(i+2);
+    }
 		lastReportSent = millis();
 	}
 }
@@ -712,7 +723,18 @@ void real_loop() { // run over and over
 	delay(300);
 }
 
-void sendMoveCommands(int i){
+void sendStopCommand(int i) {
+  byte stopMotor[]   = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFF};
+  byte size = sizeof(stopMotor);
+  
+  // Send the command multiple times to be sure
+	for(int k=0; k<2; ++k) {
+		sendSomfyMessage(STOP_MOTOR, stopMotor, size);
+		delay(40);
+	}
+}
+
+void sendMoveCommands(int i){                          
 	byte moveMotorUp[]   = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFEu, 0xFF, 0xFF, 0xFF};
 	byte moveMotorDown[] = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFFu, 0xFF, 0xFF, 0xFF};
 	byte moveMotor[]     = {0x80u, 0x80u, 0x80u, 00, 00, 00, 0xFBu, 0,    0xFF, 0xFF};
@@ -758,10 +780,22 @@ void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
 	bool commandSent = false;
 
 	for(byte i=0; i<numBlinds; ++i) {
-		if (!blinds[i].commanded) {
+		if (!blinds[i].commanded && !blinds[i].stopCommanded) {
 			continue;
 		}
 		*hasCommanded = true; // We have commanded blinds, this is always an interesting event
+
+    if (blinds[i].stopCommanded) {
+			blinds[i].commanded = 0;
+			blinds[i].commandedTime = 0;
+      blinds[i].stopCommanded = 0;
+			*shouldSendReport = true;
+			Serial.print("Blind "); Serial.print(i);
+			Serial.println(" has been commanded to stop");
+      sendStopCommand(i);
+      commandSent = true;
+      continue;
+    }
 
 		if (!differsBy(blinds[i].commandedPercent, blinds[i].curPercentage, 2)) {
 			blinds[i].commanded = 0;
@@ -795,6 +829,15 @@ void processCommandedStatus(bool *hasCommanded, bool *shouldSendReport) {
 		delay(100); // Delay to allow Somfy to process the messages
 		blindsSerial.drain();
 	}
+}
+
+void zunoSWMLCallback(byte dir,byte channel) {
+  // Stop movement
+  if (dir == 0) {
+    for(int i =0; i < numBlinds; i++) {
+      blinds[i].stopCommanded = 1;
+    }
+  }
 }
 
 #pragma clang diagnostic pop

@@ -64,6 +64,8 @@ open and fully closed. The payloads for them are:
 MOVE_TO_FULLY_OPEN:   *0x80 0x80 0x80 addr1 addr2 addr3 0xFE 0xFF 0xFF 0xFF*
 MOVE_TO_FULLY_CLOSED: *0x80 0x80 0x80 addr1 addr2 addr3 0xFF 0xFF 0xFF 0xFF*
 
+STOP_MOTOR: stops the shades *msgId=0xFD payload=0x80 x08 0x80 x80 addr1 addr2 addr3 FF
+
 You can refer to the source code for more details on parsing and sending the messages, there's
 also a helper calculator program in the *calculator.py* file.
 

@@ -135,9 +135,12 @@ void OddSoftSer::flush(void) {
 
 void OddSoftSer::write(uint8_t d) {
 	byte i = 8;
-	noInterrupts();
-	// Set the send mode
-	digitalWrite(DIRECTION_CONTROL_PIN, HIGH);
+    // Set the send mode
+    digitalWrite(DIRECTION_CONTROL_PIN, HIGH);
+
+    noInterrupts_F();
+    // to be shure that timing is right
+    sysClockSet(SYSCLOCK_NORMAL);
 
 	// Start Bit
 	digitalWrite(m_tx_pin, 0);
@@ -166,10 +169,12 @@ void OddSoftSer::write(uint8_t d) {
 	delayMicroseconds(bit_time);
 	delayMicroseconds(4);
 
-	// Set the receive mode back
-	digitalWrite(DIRECTION_CONTROL_PIN, LOW);
+    // revert back system frequency
+    sysClockNormallize();
+    interrupts_F();
 
-	interrupts();
+    // Set the receive mode back
+    digitalWrite(DIRECTION_CONTROL_PIN, LOW);
 }
 
 s_pin g_rx_pin = 12;
